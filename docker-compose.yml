@@ -1,30 +1,108 @@
-version: "3"
-services:
-  vulnado:
-    build: .
-    ports:
-      - 8080:8080
-    links:
-      - db
-      - internal_site
-    environment:
-      - PGPASSWORD=vulnado
-      - PGDATABASE=vulnado
-      - PGHOST=db:5432
-      - PGUSER=postgres
-    depends_on:
-      - "db"
+trigger:
+  - master
 
-  client:
-    build: client
-    ports:
-      - 1337:80
+pool:
+  vmImage: 'ubuntu-latest'
 
-  db:
-    image: postgres
-    environment:
-      - POSTGRES_PASSWORD=vulnado
-      - POSTGRES_DB=vulnado
+variables:
+  INTRUCEPT_CLIENT_ID: "23e4567-e89b-12d3-a456-426614174001"
+  INTRUCEPT_CLIENT_SECRET: "4d0dec93066f19b73fc9ff00643bb266"
+  INTRUCEPT_APPLICATION_ID: "687e3658d54e6f3fa113d5bf"
 
-  internal_site:
-    build: internal_site
+steps:
+- task: ArchiveFiles@2
+  inputs:
+    rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)/project.zip' 
+    replaceExistingArchive: true
+  displayName: 'Create project zip'
+
+- script: |
+    SAST_RESPONSE=$(curl -X POST       -H "Client-ID: $(INTRUCEPT_CLIENT_ID)"       -H "Client-Secret: $(INTRUCEPT_CLIENT_SECRET)"       -F "projectZipFile=@$(Build.ArtifactStagingDirectory)/project.zip"       -F "applicationId=$(INTRUCEPT_APPLICATION_ID)"       -F "scanName=SAST Scan from Azure Pipeline"       -F "language=javascript"       https://appsecops-api.intruceptlabs.com/api/v1/integrations/sast-scans)
+    
+    # Check for error in response.
+    ERROR=$(echo "$SAST_RESPONSE" | jq -r '.error // empty')
+    if [ ! -z "$ERROR" ]; then
+       echo "Error: $ERROR"
+       exit 1
+    else
+      VULNS_TABLE=$(echo "$SAST_RESPONSE" | jq -r '.vulnsTable')
+      echo "Vulnerabilities Table:"
+      echo "$VULNS_TABLE"
+    fi 
+  displayName: 'Perform SAST Scan'
+  name: Java-sastScan
+
+- script: |
+    SCA_RESPONSE=$(curl -X POST       -H "Client-ID: $(INTRUCEPT_CLIENT_ID)"       -H "Client-Secret: $(INTRUCEPT_CLIENT_SECRET)"       -F "projectZipFile=@$(Build.ArtifactStagingDirectory)/project.zip"       -F "applicationId=$(INTRUCEPT_APPLICATION_ID)"       -F "scanName=SCA Scan from Azure Pipeline"       -F "language=javascript"       https://appsecops-api.intruceptlabs.com/api/v1/integrations/sca-scans)
+    
+    # Check for error in response.
+    ERROR=$(echo "$SCA_RESPONSE" | jq -r '.error // empty')
+    if [ ! -z "$ERROR" ]; then
+       echo "Error: $ERROR"
+       exit 1
+    else
+      VULNS_TABLE=$(echo "$SCA_RESPONSE" | jq -r '.vulnsTable')
+      echo "Vulnerabilities Table:"
+      echo "$VULNS_TABLE"
+    fi 
+  displayName: 'Perform SCA Scan'
+  name: scaScan
+
+- script: |
+    echo "SAST or SCA scan failed. Deployment cancelled."
+    exit 1
+  condition: and(succeeded(), or(ne(variables['sastScan.sastCanProceed'], 'true'), ne(variables['scaScan.scaCanProceed'], 'true')))
+  displayName: 'Check SAST and SCA results'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)/project.zip'
+    artifactName: 'drop'
+  displayName: 'Publish Artifact'
+  condition: and(succeeded(), eq(variables['sastScan.sastCanProceed'], 'true'), eq(variables['scaScan.scaCanProceed'], 'true'))
+
+- task: DownloadBuildArtifacts@0
+  inputs:
+    buildType: 'current'
+    downloadType: 'single'
+    artifactName: 'drop'
+    downloadPath: '$(System.ArtifactsDirectory)'
+
+- task: ExtractFiles@1
+  inputs:
+    archiveFilePatterns: '$(System.ArtifactsDirectory)/drop/project.zip'
+    destinationFolder: '$(System.DefaultWorkingDirectory)/extracted'
+    cleanDestinationFolder: true
+
+- task: NodeTool@0
+  inputs:
+    versionSpec: '18'
+  displayName: 'Install Node.js'
+
+- script: |
+    cd $(System.DefaultWorkingDirectory)/extracted
+    npm ci
+    npm run build
+  displayName: 'npm install and build'
+
+- task: Bash@3
+  inputs:
+    targetType: 'inline'
+    script: |
+      git config --global user.email "azurepipeline@example.com"
+      git config --global user.name "Azure Pipeline"
+      
+      cd $(System.DefaultWorkingDirectory)/extracted
+      
+      git init
+      git add .
+      git commit -m "Deploy from Azure Pipelines"
+      
+      git remote add origin https://x-access-token:$(GITHUB_TOKEN)@github.com/ravi-intrucept/Vulnado_gradle.git
+      git push -f origin HEAD:main
+  env:
+    GITHUB_TOKEN: $(GITHUB_TOKEN)
+  displayName: 'Push to GitHub'
